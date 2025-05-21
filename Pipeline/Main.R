@@ -1,6 +1,6 @@
-# ***************************************
+# *****************************************
 # Main Script: Bioinformatics Pipeline
-# ***************************************
+# *****************************************
 
 # Load modules
 source("Reduce_Sampling_module.R")
@@ -11,75 +11,95 @@ source("Alignment_Evaluation_module.R")
 source("Variant_Calling_module.R")
 source("Annotation_Module.R")
 
-
-# Activating args[]
+# Preparing arguments
 args <- commandArgs(trailingOnly = TRUE)
-
-# Getting args[]
-get_param <- function(i, line_text, default = NULL) {
+get_param <- function(i, text, default = NULL) {
   if (interactive()) {
-    input <- readline(paste0(line_text, if (!is.null(default)) paste0(" [", default, "]"), ": "))
-    return(ifelse(input == "", default, input))
-  } else {
-    return(ifelse(length(args) >= i, args[[i]], default))
+    resp <- readline(paste0(text, if (!is.null(default)) paste0(" [", default, "]"), ": "))
+    return(ifelse(resp == "", default, resp))
   }
+  if (length(args) >= i) return(args[[i]])
+  return(default)
 }
 
-# Saving args[] in variables
-readfile1   <- get_param(1, "File path 1")
-readfile2   <- get_param(2, "File path 2", default = NULL)
-sample_name <- get_param(3, "Sample name", default = "sample")
-read_type   <- get_param(4, "Read type (single/paired)", default = "single")
-file_type   <- get_param(5, "Type of file (fastq, fq)", default = "fastq")
-ref_genome  <- get_param(6, "Genome of reference")
-do_subsample <- get_param(7, "Do subsampling? (yes/no)", default = "no")
+# Reading parameters
+readfile1    <- get_param(1, "FASTQ R1 path")
+readfile2    <- get_param(2, "FASTQ R2 path", default = NULL)
+sample_name  <- get_param(3, "Sample name", default = "sample")
+read_type    <- tolower(get_param(4, "Read type (single/paired)", default = "single"))
+file_type    <- tolower(get_param(5, "File type (fastq/fq)",    default = "fastq"))
+ref_genome   <- get_param(6, "Reference genome FASTA path")
+do_subsamp   <- tolower(get_param(7, "Do you want to subsample? (yes/no)", default="no"))
 
-# Derived names
-timestamp <- format(Sys.time(), "%Y%m%d_%H%M")
-subsampled_fastq1 <- file.path("../Data/SubSampling", paste0(sample_name, "_1_subsample.fastq"))
-subsampled_fastq2 <- file.path("../Data/SubSampling", paste0(sample_name, "_2_subsample.fastq"))
-
-
-# Step 0: Subsampling if requested
-if (tolower(do_subsample) == "yes") {
-  run_subsampling(readfile1, readfile2, sample_name, 100000, out_dir = "../Data/SubSampling")
-  readfile1 <- subsampled_fastq1
-  if (!is.null(readfile2)) {
-    readfile2 <- subsampled_fastq2
-  }
+# Subsampling
+if (do_subsamp == "yes") {
+  subs <- run_subsampling(
+    readfile1, readfile2,
+    sample_name = sample_name,
+    n           = 100000,
+    out_dir     = file.path("Outputs","SubSampling")
+  )
+  readfile1 <- subs$fastq1
+  readfile2 <- subs$fastq2
 }
 
-if (tolower(file_type) == "fq") {
-  file_type <- "fastq"
-}
+# QC
+run_qc(
+  readfile1, readfile2,
+  sample_name = sample_name,
+  read_type   = read_type,
+  file_type   = file_type
+)
 
-# Run QC
-run_qc(readfile1, readfile2, sample_name, read_type, file_type)
-
-# Ask user if they want to filter after quality control
-do_filtering_qc <- get_param(8, "Do you want to filter the reads? (yes/no)", default = "no")
-if (tolower(do_filtering_qc) == "yes") {
-  quality_threshold <- as.numeric(get_param(9, "Minimum average quality (Phred)", default = "30"))
-  min_length <- as.numeric(get_param(10, "Minimum read length", default = "30"))
-  filtered <- run_filtering(readfile1, readfile2, sample_name, read_type, quality_threshold, min_length)
-  readfile1 <- filtered$fastq1
-  if (read_type == "paired") readfile2 <- filtered$fastq2
+# Filtering FASTQ
+do_filter_qc <- tolower(get_param(8, "Filter reads by quality? (yes/no)", default="no"))
+if (do_filter_qc == "yes") {
+  q_thr <- as.numeric(get_param(9, "Min average quality", default="30"))
+  fastq_res <- run_filtering(
+    fastq1           = readfile1,
+    fastq2           = readfile2,
+    sample_name      = sample_name,
+    read_type        = read_type,
+    quality_threshold= q_thr,
+    do_bam_filter    = FALSE
+  )
+  readfile1 <- fastq_res$fastq$fastq1
+  readfile2 <- fastq_res$fastq$fastq2
 }
 
 # Alignment
-aligned_bam <- run_alignment(readfile1, readfile2, ref_genome, sample_name, read_type)
-run_alignment_evaluation(aligned_bam)
+aligned_bam <- run_alignment(
+  readfile1, readfile2,
+  ref_genome  = ref_genome,
+  sample_name = sample_name,
+  read_type   = read_type
+)
 
+# Alignemnt Evaluation
+eval_res   <- run_alignment_evaluation(aligned_bam, sample_name)
+sorted_bam <- eval_res$sorted_bam
 
-
-# Ask user if they want to filter after alignment
-do_filtering_bam <- get_param(11, "Do you want to filter the reads? (yes/no)", default = "no")
-if (tolower(do_filtering_bam) == "yes") {
-  min_cov <- as.numeric(get_param(12, "Minimum coverage", default = "10"))
-  aligned_bam <- filter_bam_by_coverage(aligned_bam, sample_name, min_coverage = min_cov)
+# Filtering BAM
+do_filter_bam <- tolower(get_param(11, "Filter BAM by coverage? (yes/no)", default="no"))
+if (do_filter_bam == "yes") {
+  min_cov <- as.numeric(get_param(12, "Min coverage", default="10"))
+  sorted_bam <- filter_bam_by_coverage(
+    bam_file    = sorted_bam,
+    sample_name = sample_name,
+    min_coverage= min_cov
+  )
 }
 
-# Variant Calling and Annotation
-vcf <- run_variant_calling(aligned_bam, ref_genome)
-## annot <- run_annotation(vcf)
+# Variant Calling
+vcf <- run_variant_calling(
+  bam_file       = sorted_bam,
+  reference_fasta= ref_genome,
+  sample_name    = sample_name
+)
 
+# Annotation
+annot_res <- run_annotation(
+  vcf_file    = vcf,
+  genome_build= "hg38",
+  sample_name = sample_name
+)
