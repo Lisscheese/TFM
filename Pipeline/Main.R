@@ -1,6 +1,12 @@
-# *****************************************
-# Main Script: Bioinformatics Pipeline
-# *****************************************
+# -------------------------------------
+# Shiny Interface for Genomic Pipeline
+# -------------------------------------
+
+options(shiny.maxRequestSize = 88 * 1024 * 1024 * 1024 * 2)
+
+library(shiny)
+library(fs)
+library(shinythemes)
 
 # Load modules
 source("Reduce_Sampling_module.R")
@@ -11,95 +17,120 @@ source("Alignment_Evaluation_module.R")
 source("Variant_Calling_module.R")
 source("Annotation_Module.R")
 
-# Preparing arguments
-args <- commandArgs(trailingOnly = TRUE)
-get_param <- function(i, text, default = NULL) {
-  if (interactive()) {
-    resp <- readline(paste0(text, if (!is.null(default)) paste0(" [", default, "]"), ": "))
-    return(ifelse(resp == "", default, resp))
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  titlePanel("Genomic Pipeline - Interactive Interface"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("readfile1", "Read File 1 (R1)", accept = c(".fq", ".fastq")),
+      fileInput("readfile2", "Read File 2 (R2, optional)", accept = c(".fq", ".fastq")),
+      textInput("sample_name", "Sample Name", value = "sample"),
+      selectInput("read_type", "Read Type", choices = c("single", "paired")),
+      fileInput("ref_genome", "Reference Genome (FASTA)", accept = ".fa"),
+      checkboxInput("do_subsample", "Perform Subsampling?", value = FALSE),
+      numericInput("subsample_n", "Reads for Subsampling", value = 100000),
+      checkboxInput("do_filter_qc", "Filter after QC", value = FALSE),
+      numericInput("min_quality", "Min Average Quality", value = 30),
+      numericInput("min_length", "Min Read Length", value = 30),
+      checkboxInput("do_filter_bam", "Filter BAM by Coverage", value = FALSE),
+      numericInput("min_coverage", "Min Coverage for BAM Filter", value = 10),
+      actionButton("run_qc", "Step 1: Run Quality Control"),
+      actionButton("run_filter_qc", "Step 2: Filter after QC"),
+      actionButton("run_align", "Step 3: Alignment"),
+      actionButton("run_filter_bam", "Step 4: Filter BAM"),
+      actionButton("run_variant_call", "Step 5: Variant Calling"),
+      verbatimTextOutput("file_status")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Console Log", verbatimTextOutput("log")),
+        tabPanel("Alignment Summary", verbatimTextOutput("align_summary")),
+        tabPanel("Variant Calls", verbatimTextOutput("variant_output"))
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  log_text <- reactiveVal("")
+  append_log <- function(msg) {
+    log_text(paste(log_text(), msg, sep = "\n"))
   }
-  if (length(args) >= i) return(args[[i]])
-  return(default)
+  
+  output$file_status <- renderText({
+    if (is.null(input$readfile1)) {
+      "⏳ Waiting for Read File 1 upload..."
+    } else {
+      paste("✔ File uploaded:", input$readfile1$name)
+    }
+  })
+  
+  observeEvent(input$run_qc, {
+    req(input$readfile1)
+    withProgress(message = "Running Quality Control...", value = 0.1, {
+      readfile1 <- input$readfile1$datapath
+      readfile2 <- if (!is.null(input$readfile2)) input$readfile2$datapath else NULL
+      run_qc(readfile1, readfile2, input$sample_name, input$read_type)
+      incProgress(1)
+    })
+    append_log("✔ Quality Control completed.")
+  })
+  
+  observeEvent(input$run_filter_qc, {
+    req(input$readfile1)
+    withProgress(message = "Running QC Filtering...", value = 0.1, {
+      readfile1 <- input$readfile1$datapath
+      readfile2 <- if (!is.null(input$readfile2)) input$readfile2$datapath else NULL
+      run_filtering(readfile1, readfile2, input$sample_name, input$read_type, input$min_quality, input$min_length)
+      incProgress(1)
+    })
+    append_log("✔ QC filtering completed.")
+  }) 
+  
+  observeEvent(input$run_align, {
+    req(input$ref_genome)
+    withProgress(message = "Running Alignment...", value = 0.1, {
+      readfile1 <- input$readfile1$datapath
+      readfile2 <- if (!is.null(input$readfile2)) input$readfile2$datapath else NULL
+      aligned <- run_alignment(readfile1, readfile2, input$ref_genome$datapath, input$sample_name, input$read_type)
+      incProgress(1)
+      append_log(paste("✔ Alignment completed. Output:", aligned))
+    })
+  })
+  
+  observeEvent(input$run_filter_bam, {
+    withProgress(message = "Filtering BAM file...", value = 0.1, {
+      bam_file <- paste0("../Data/Alignment_output/", input$sample_name, "_aligned.bam")
+      filtered <- filter_bam_by_coverage(bam_file, input$sample_name, min_coverage = input$min_coverage)
+      incProgress(1)
+      append_log(paste("✔ BAM filtering completed. Output:", filtered))
+    })
+  })
+  
+  observeEvent(input$run_variant_call, {
+    withProgress(message = "Calling Variants...", value = 0.1, {
+      bam_file <- paste0("../Data/Alignment_output/", input$sample_name, "_aligned.bam")
+      vcf_file <- run_variant_calling(bam_file, input$ref_genome$datapath)
+      incProgress(1)
+      append_log(paste("✔ Variant calling completed. Output:", vcf_file))
+    })
+  })
+  
+  output$log <- renderText({
+    log_text()
+  })
+  
+  output$align_summary <- renderText({
+    file <- "alignment_summary.csv"
+    if (file.exists(file)) paste(readLines(file, warn = FALSE), collapse = "\n") else "Alignment summary not available."
+  })
+  
+  output$variant_output <- renderText({
+    file <- "variants_called.vcf"
+    if (file.exists(file)) paste(head(readLines(file, warn = FALSE), 20), collapse = "\n") else "VCF output not available."
+  })
 }
 
-# Reading parameters
-readfile1    <- get_param(1, "FASTQ R1 path")
-readfile2    <- get_param(2, "FASTQ R2 path", default = NULL)
-sample_name  <- get_param(3, "Sample name", default = "sample")
-read_type    <- tolower(get_param(4, "Read type (single/paired)", default = "single"))
-file_type    <- tolower(get_param(5, "File type (fastq/fq)",    default = "fastq"))
-ref_genome   <- get_param(6, "Reference genome FASTA path")
-do_subsamp   <- tolower(get_param(7, "Do you want to subsample? (yes/no)", default="no"))
-
-# Subsampling
-if (do_subsamp == "yes") {
-  subs <- run_subsampling(
-    readfile1, readfile2,
-    sample_name = sample_name,
-    n           = 100000,
-    out_dir     = file.path("Outputs","SubSampling")
-  )
-  readfile1 <- subs$fastq1
-  readfile2 <- subs$fastq2
-}
-
-# QC
-run_qc(
-  readfile1, readfile2,
-  sample_name = sample_name,
-  read_type   = read_type,
-  file_type   = file_type
-)
-
-# Filtering FASTQ
-do_filter_qc <- tolower(get_param(8, "Filter reads by quality? (yes/no)", default="no"))
-if (do_filter_qc == "yes") {
-  q_thr <- as.numeric(get_param(9, "Min average quality", default="30"))
-  fastq_res <- run_filtering(
-    fastq1           = readfile1,
-    fastq2           = readfile2,
-    sample_name      = sample_name,
-    read_type        = read_type,
-    quality_threshold= q_thr,
-    do_bam_filter    = FALSE
-  )
-  readfile1 <- fastq_res$fastq$fastq1
-  readfile2 <- fastq_res$fastq$fastq2
-}
-
-# Alignment
-aligned_bam <- run_alignment(
-  readfile1, readfile2,
-  ref_genome  = ref_genome,
-  sample_name = sample_name,
-  read_type   = read_type
-)
-
-# Alignemnt Evaluation
-eval_res   <- run_alignment_evaluation(aligned_bam, sample_name)
-sorted_bam <- eval_res$sorted_bam
-
-# Filtering BAM
-do_filter_bam <- tolower(get_param(11, "Filter BAM by coverage? (yes/no)", default="no"))
-if (do_filter_bam == "yes") {
-  min_cov <- as.numeric(get_param(12, "Min coverage", default="10"))
-  sorted_bam <- filter_bam_by_coverage(
-    bam_file    = sorted_bam,
-    sample_name = sample_name,
-    min_coverage= min_cov
-  )
-}
-
-# Variant Calling
-vcf <- run_variant_calling(
-  bam_file       = sorted_bam,
-  reference_fasta= ref_genome,
-  sample_name    = sample_name
-)
-
-# Annotation
-annot_res <- run_annotation(
-  vcf_file    = vcf,
-  genome_build= "hg38",
-  sample_name = sample_name
-)
+shinyApp(ui = ui, server = server)
