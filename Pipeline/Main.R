@@ -1,14 +1,13 @@
-# -------------------------------------
+# ***************************************
 # Shiny Interface for Genomic Pipeline
-# -------------------------------------
+# ***************************************
 
-options(shiny.maxRequestSize = 88 * 1024 * 1024 * 1024 * 2)
+options(shiny.maxRequestSize = 8 * 1024^10)
 
 library(shiny)
-library(fs)
 library(shinythemes)
 
-# Load modules
+# Load modules 
 source("Reduce_Sampling_module.R")
 source("Quality_Control_module.R")
 source("Filtering_module.R")
@@ -17,120 +16,270 @@ source("Alignment_Evaluation_module.R")
 source("Variant_Calling_module.R")
 source("Annotation_Module.R")
 
+# UI definition
 ui <- fluidPage(
+  # Custom CSS
+  tags$head(tags$style(HTML(
+    "
+    body { background-color: white; }
+    .btn-primary { background-color: #2b8cbe; color: white; }
+    .btn { background-color: #2b8cbe; color: white; }
+    .btn-danger { background-color: #d73027; color: white; }
+    .form-control, textarea { background-color: #e6f5e6; }
+    .shiny-input-container { margin-bottom: 15px; }
+    h2, h3, h4 { color: #2b8cbe; }
+    #console { 
+              background: #000; 
+              color: #0f0; 
+              padding: 10px; 
+              font-family: monospace; 
+              height: 1200px; 
+              overflow-y: auto; 
+              white-space: pre-wrap; 
+    }
+    "
+  ))),
   theme = shinytheme("flatly"),
-  titlePanel("Genomic Pipeline - Interactive Interface"),
-  
+  titlePanel("Genomic Pipeline - Console Interface"),
   sidebarLayout(
     sidebarPanel(
       fileInput("readfile1", "Read File 1 (R1)", accept = c(".fq", ".fastq")),
       fileInput("readfile2", "Read File 2 (R2, optional)", accept = c(".fq", ".fastq")),
+      fileInput("sorted_bam_upload", "Sorted BAM (optional)", accept = ".bam"),
+      fileInput("ref_genome", "Reference Genome (FASTA)", accept = ".fa"),
       textInput("sample_name", "Sample Name", value = "sample"),
       selectInput("read_type", "Read Type", choices = c("single", "paired")),
-      fileInput("ref_genome", "Reference Genome (FASTA)", accept = ".fa"),
-      checkboxInput("do_subsample", "Perform Subsampling?", value = FALSE),
-      numericInput("subsample_n", "Reads for Subsampling", value = 100000),
-      checkboxInput("do_filter_qc", "Filter after QC", value = FALSE),
+      selectInput("file_type", "File Format", choices = c("fastq", "fq")),
+      hr(),
+      checkboxInput("do_subsample", "Enable Subsampling", value = FALSE),
+      numericInput("subsample_n", "Subsample reads N", value = 100000),
+      actionButton("run_subsample", "Run Subsampling", class = "btn btn-primary"),
+      hr(),
+      actionButton("run_qc", "Run Quality Control", class = "btn btn-primary"),
+      hr(),
+      checkboxInput("do_filter_qc", "Enable FASTQ Filtering", value = FALSE),
       numericInput("min_quality", "Min Average Quality", value = 30),
-      numericInput("min_length", "Min Read Length", value = 30),
-      checkboxInput("do_filter_bam", "Filter BAM by Coverage", value = FALSE),
-      numericInput("min_coverage", "Min Coverage for BAM Filter", value = 10),
-      actionButton("run_qc", "Step 1: Run Quality Control"),
-      actionButton("run_filter_qc", "Step 2: Filter after QC"),
-      actionButton("run_align", "Step 3: Alignment"),
-      actionButton("run_filter_bam", "Step 4: Filter BAM"),
-      actionButton("run_variant_call", "Step 5: Variant Calling"),
-      verbatimTextOutput("file_status")
+      actionButton("run_filter_qc", "Run FASTQ Filtering", class = "btn btn-primary"),
+      hr(),
+      actionButton("run_align", "Run Alignment", class = "btn btn-primary"),
+      actionButton("run_eval", "Evaluate Alignment", class = "btn btn-primary"),
+      hr(),
+      checkboxInput("do_filter_bam", "Enable BAM Filtering", value = FALSE),
+      numericInput("min_coverage", "Min Coverage", value = 10),
+      actionButton("run_filter_bam", "Run BAM Filtering", class = "btn btn-primary"),
+      hr(),
+      actionButton("run_variant_call", "Run Variant Calling", class = "btn btn-primary"),
+      actionButton("run_annotation", "Run Annotation", class = "btn btn-primary"),
+      hr(),
+      actionButton("exit", "Exit App", class = "btn btn-danger")
     ),
-    
     mainPanel(
-      tabsetPanel(
-        tabPanel("Console Log", verbatimTextOutput("log")),
-        tabPanel("Alignment Summary", verbatimTextOutput("align_summary")),
-        tabPanel("Variant Calls", verbatimTextOutput("variant_output"))
-      )
+      tags$div(id = "console", verbatimTextOutput("console", placeholder = TRUE))
     )
   )
 )
 
+# Server logic
 server <- function(input, output, session) {
-  log_text <- reactiveVal("")
-  append_log <- function(msg) {
-    log_text(paste(log_text(), msg, sep = "\n"))
+  rv <- reactiveValues(
+    read1      = NULL,
+    read2      = NULL,
+    sorted_bam = NULL,
+    vcf        = NULL,
+    annot      = NULL,
+    console    = "Console log started"
+  )
+  
+  # helper to append console
+  appendConsole <- function(msg) {
+    timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    rv$console <- paste(rv$console, paste0("[", timestamp, "] ", msg), sep = "\n")
   }
   
-  output$file_status <- renderText({
-    if (is.null(input$readfile1)) {
-      "⏳ Waiting for Read File 1 upload..."
-    } else {
-      paste("✔ File uploaded:", input$readfile1$name)
-    }
+  # helper to run an expression once, capture stdout + message()
+  runAndLog <- function(expr) {
+    expr_code <- substitute(expr)
+
+    txt <- capture.output(
+      withCallingHandlers(
+        {
+          eval(expr_code, envir = parent.frame())
+        },
+        message = function(m) {
+
+          cat(conditionMessage(m), "\n")
+          invokeRestart("muffleMessage")
+        }
+      ),
+      type = "output"
+    )
+    lines <- unlist(strsplit(paste(txt, collapse = "\n"), "\n"))
+    lapply(lines, appendConsole)
+  }
+  
+  # monitor uploads
+  observeEvent(input$readfile1, {
+    rv$read1 <- input$readfile1$datapath
+    appendConsole(paste("Loaded Read 1:", basename(rv$read1)))
+  })
+  observeEvent(input$readfile2, {
+    rv$read2 <- input$readfile2$datapath
+    appendConsole(paste("Loaded Read 2:", basename(rv$read2)))
+  })
+  observeEvent(input$sorted_bam_upload, {
+    rv$sorted_bam <- input$sorted_bam_upload$datapath
+    appendConsole(paste("Loaded sorted BAM:", basename(rv$sorted_bam)))
+  })
+  observeEvent(input$ref_genome, {
+    appendConsole(paste("Loaded reference FASTA:", basename(input$ref_genome$datapath)))
   })
   
+  output$console <- renderText({ rv$console })
+  
+  # Subsampling
+  observeEvent(input$run_subsample, {
+    req(rv$read1)
+    appendConsole("** Subsampling step started **")
+    tryCatch({
+      runAndLog({ subs <- run_subsampling(
+        rv$read1, rv$read2,
+        sample_name = input$sample_name,
+        n           = input$subsample_n
+      )
+      rv$read1 <- subs$fastq1; rv$read2 <- subs$fastq2
+      })
+      appendConsole(paste("Subsampling completed:", basename(rv$read1), basename(rv$read2)))
+    }, error = function(e) appendConsole(paste("ERROR in subsampling:", e$message)))
+  })
+  
+  # Quality Control
   observeEvent(input$run_qc, {
-    req(input$readfile1)
-    withProgress(message = "Running Quality Control...", value = 0.1, {
-      readfile1 <- input$readfile1$datapath
-      readfile2 <- if (!is.null(input$readfile2)) input$readfile2$datapath else NULL
-      run_qc(readfile1, readfile2, input$sample_name, input$read_type)
-      incProgress(1)
-    })
-    append_log("✔ Quality Control completed.")
+    req(rv$read1, input$ref_genome)
+    appendConsole("** QC step started **")
+    tryCatch({
+      fmt <- ifelse(input$file_type == "fq", "fastq", input$file_type)
+      runAndLog(run_qc(
+        readfile1   = rv$read1,
+        readfile2   = rv$read2,
+        sample_name = input$sample_name,
+        read_type   = input$read_type,
+        file_type   = fmt
+      ))
+      appendConsole("QC completed successfully.")
+    }, error = function(e) appendConsole(paste("ERROR in QC:", e$message)))
   })
   
+  # FASTQ Filtering
   observeEvent(input$run_filter_qc, {
-    req(input$readfile1)
-    withProgress(message = "Running QC Filtering...", value = 0.1, {
-      readfile1 <- input$readfile1$datapath
-      readfile2 <- if (!is.null(input$readfile2)) input$readfile2$datapath else NULL
-      run_filtering(readfile1, readfile2, input$sample_name, input$read_type, input$min_quality, input$min_length)
-      incProgress(1)
-    })
-    append_log("✔ QC filtering completed.")
-  }) 
+    req(rv$read1)
+    appendConsole("** FASTQ filtering step started **")
+    tryCatch({
+      if (input$do_filter_qc) {
+        runAndLog({
+          ff <- run_fastq_filtering(
+            fastq1            = rv$read1,
+            fastq2            = rv$read2,
+            sample_name       = input$sample_name,
+            read_type         = input$read_type,
+            quality_threshold = input$min_quality
+          )
+          rv$read1 <- ff$fastq1
+          rv$read2 <- ff$fastq2
+        })
+        appendConsole("FASTQ filtering completed.")
+      } else {
+        appendConsole("FASTQ filtering skipped (checkbox disabled)")
+      }
+    }, error = function(e) appendConsole(paste("ERROR in FASTQ filtering:", e$message)))
+  })
   
+  
+  # Alignment
   observeEvent(input$run_align, {
-    req(input$ref_genome)
-    withProgress(message = "Running Alignment...", value = 0.1, {
-      readfile1 <- input$readfile1$datapath
-      readfile2 <- if (!is.null(input$readfile2)) input$readfile2$datapath else NULL
-      aligned <- run_alignment(readfile1, readfile2, input$ref_genome$datapath, input$sample_name, input$read_type)
-      incProgress(1)
-      append_log(paste("✔ Alignment completed. Output:", aligned))
-    })
+    req(rv$read1, input$ref_genome)
+    appendConsole("** Alignment step started **")
+    tryCatch({
+      runAndLog({
+        aligned <- run_alignment(
+          readfile1   = rv$read1,
+          readfile2   = rv$read2,
+          ref_genome  = input$ref_genome$datapath,
+          sample_name = input$sample_name,
+          read_type   = input$read_type
+        )
+        rv$sorted_bam <- aligned
+      })
+      appendConsole("Alignment completed.")
+    }, error = function(e) appendConsole(paste("ERROR in alignment:", e$message)))
   })
   
+  # Evaluate Alignment
+  observeEvent(input$run_eval, {
+    req(rv$sorted_bam)
+    appendConsole("** Evaluation step started **")
+    tryCatch({
+      runAndLog({ rs <- run_alignment_evaluation(rv$sorted_bam, sample_name = input$sample_name)
+      rv$sorted_bam <- rs$sorted_bam
+      })
+      appendConsole("Evaluation completed.")
+    }, error = function(e) appendConsole(paste("ERROR in evaluation:", e$message)))
+  })
+  
+  # BAM Filtering
   observeEvent(input$run_filter_bam, {
-    withProgress(message = "Filtering BAM file...", value = 0.1, {
-      bam_file <- paste0("../Data/Alignment_output/", input$sample_name, "_aligned.bam")
-      filtered <- filter_bam_by_coverage(bam_file, input$sample_name, min_coverage = input$min_coverage)
-      incProgress(1)
-      append_log(paste("✔ BAM filtering completed. Output:", filtered))
-    })
+    req(rv$sorted_bam)
+    appendConsole("** BAM filtering step started **")
+    tryCatch({
+      if (input$do_filter_bam) {
+        runAndLog({
+          rv$sorted_bam <- run_bam_filtering(
+            bam_file     = rv$sorted_bam,
+            sample_name  = input$sample_name,
+            min_coverage = input$min_coverage
+          )
+        })
+        appendConsole("BAM filtering completed.")
+      } else {
+        appendConsole("BAM filtering skipped (checkbox disabled)")
+      }
+    }, error = function(e) appendConsole(paste("ERROR in BAM filtering:", e$message)))
   })
   
+  
+  # Variant Calling
   observeEvent(input$run_variant_call, {
-    withProgress(message = "Calling Variants...", value = 0.1, {
-      bam_file <- paste0("../Data/Alignment_output/", input$sample_name, "_aligned.bam")
-      vcf_file <- run_variant_calling(bam_file, input$ref_genome$datapath)
-      incProgress(1)
-      append_log(paste("✔ Variant calling completed. Output:", vcf_file))
-    })
+    req(rv$sorted_bam, input$ref_genome)
+    appendConsole("** Variant calling step started **")
+    tryCatch({
+      runAndLog({ rv$vcf <- run_variant_calling(
+        bam_file        = rv$sorted_bam,
+        reference_fasta = input$ref_genome$datapath,
+        sample_name     = input$sample_name
+      )
+      })
+      appendConsole("Variant calling completed.")
+    }, error = function(e) appendConsole(paste("ERROR in variant calling:", e$message)))
   })
   
-  output$log <- renderText({
-    log_text()
+  # Annotation
+  observeEvent(input$run_annotation, {
+    req(rv$vcf)
+    appendConsole("** Annotation step started **")
+    tryCatch({
+      runAndLog({ ann <- run_annotation(
+        vcf_file     = rv$vcf,
+        genome_build = "hg38",
+        sample_name  = input$sample_name
+      )
+      rv$annot <- ann
+      })
+      appendConsole("Annotation completed.")
+    }, error = function(e) appendConsole(paste("ERROR in annotation:", e$message)))
   })
   
-  output$align_summary <- renderText({
-    file <- "alignment_summary.csv"
-    if (file.exists(file)) paste(readLines(file, warn = FALSE), collapse = "\n") else "Alignment summary not available."
-  })
-  
-  output$variant_output <- renderText({
-    file <- "variants_called.vcf"
-    if (file.exists(file)) paste(head(readLines(file, warn = FALSE), 20), collapse = "\n") else "VCF output not available."
-  })
+  # Exit
+  observeEvent(input$exit, { stopApp() })
 }
 
+# Launch the app
 shinyApp(ui = ui, server = server)
