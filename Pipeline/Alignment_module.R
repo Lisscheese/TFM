@@ -5,7 +5,7 @@
 library(Rsubread)
 
 # Align FASTQ reads to a reference genome locally stored and return the path to the resulting BAM file.
-# Uses an index in 'Data/Prebuilt_Indexes/ref_index', building it only if missing.
+# Uses an index in Data/Prebuilt_Indexes/ref_index, building it only if missing.
 run_alignment <- function(readfile1, readfile2 = NULL, ref_genome,sample_name,read_type = "single")
 {
   # Init of folder where we store shared index, I added this step because it is usefull when

@@ -8,7 +8,7 @@ library(GenomicAlignments)
 # Evaluates an aligned BAM file and executes idxstats to generate statistics
 run_alignment_evaluation <- function( bam_file, sample_name = tools::file_path_sans_ext(basename(bam_file))) 
 {
-  # Init of crea
+  # Init of outputs folder names
   eval_dir <- file.path("..", "Outputs", "Alignment_Evaluation", sample_name)
   if (!dir.exists(eval_dir)) {
     dir.create(eval_dir, recursive = TRUE, showWarnings = FALSE)
